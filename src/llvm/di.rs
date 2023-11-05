@@ -1,11 +1,12 @@
 use std::{
+    borrow::Cow,
     collections::{hash_map::DefaultHasher, HashSet},
     ffi::CStr,
     hash::Hasher,
 };
 
 use gimli::{DW_TAG_pointer_type, DW_TAG_structure_type, DW_TAG_variant_part};
-use llvm_sys::{core::*, debuginfo::*, prelude::*};
+use llvm_sys::{core::*, debuginfo::*, prelude::*, LLVMValueKind};
 use log::{trace, warn};
 
 use super::{
@@ -289,7 +290,7 @@ impl DISanitizer {
         assert_eq!(self.node_stack.pop(), Some(value));
     }
 
-    pub unsafe fn run(&mut self) {
+    pub unsafe fn run(&mut self, export_symbols: &HashSet<Cow<'static, str>>) {
         for sym in self.module.named_metadata_iter() {
             let mut len: usize = 0;
             let name = CStr::from_ptr(LLVMGetNamedMetadataName(sym, &mut len))
@@ -311,7 +312,108 @@ impl DISanitizer {
         }
 
         for function in module.functions_iter() {
-            trace!("function > name:{}", symbol_name(function));
+            let name = symbol_name(function);
+            if export_symbols.contains(name) {
+                continue;
+            }
+
+            // Skip functions that don't have subprograms.
+            let sub_program = LLVMGetSubprogram(function);
+            if sub_program.is_null() {
+                continue;
+            }
+            let sub_program_val = LLVMMetadataAsValue(self.context, sub_program);
+
+            let scope = LLVMValueAsMetadata(LLVMGetOperand(sub_program_val, 1));
+
+            let mut name_len = 0;
+            let mut linkage_name_len = 0;
+            // LLVMGetMDString handles NULL input so we don't have to explicitly check
+            let name = LLVMGetMDString(LLVMGetOperand(sub_program_val, 2), &mut name_len);
+            let linkage_name =
+                LLVMGetMDString(LLVMGetOperand(sub_program_val, 3), &mut linkage_name_len);
+
+            let ty = LLVMValueAsMetadata(LLVMGetOperand(sub_program_val, 4));
+
+            // Create a new subprogram that has DISPFlagLocalToUnit set, so the BTF backend emits it
+            // with linkage=static
+            let new_program = LLVMDIBuilderCreateFunction(
+                self.builder,
+                scope,
+                name,
+                name_len as usize,
+                linkage_name,
+                linkage_name_len as usize,
+                LLVMDIScopeGetFile(sub_program),
+                LLVMDISubprogramGetLine(sub_program),
+                ty,
+                1,
+                1,
+                LLVMDISubprogramGetLine(sub_program),
+                LLVMDITypeGetFlags(sub_program),
+                1,
+            );
+            // Technically this must be called as part of the builder API, but effectively does
+            // nothing because we don't add any variables through the builder API, instead we
+            // replace retained nodes manually below.
+            LLVMDIBuilderFinalizeSubprogram(self.builder, new_program);
+            // Point the function to the new subprogram.
+            LLVMSetSubprogram(function, new_program);
+
+            // There's no way to set the unit with LLVMDIBuilderCreateFunction
+            // so we set it after creation.
+            let unit = LLVMValueAsMetadata(LLVMGetOperand(
+                LLVMMetadataAsValue(self.context, sub_program),
+                5,
+            ));
+            LLVMReplaceMDNodeOperandWith(LLVMMetadataAsValue(self.context, new_program), 5, unit);
+
+            // Add retained nodes from the old program. This is needed to preserve local debug
+            // variables, including function arguments which otherwise become "anon". See
+            // LLVMDIBuilderFinalizeSubprogram and DISubprogram::replaceRetainedNodes.
+            let retained_nodes = LLVMGetOperand(LLVMMetadataAsValue(self.context, sub_program), 7);
+            LLVMReplaceMDNodeOperandWith(
+                LLVMMetadataAsValue(self.context, new_program),
+                7,
+                LLVMValueAsMetadata(retained_nodes),
+            );
+
+            // Remove retained nodes from the old program. In the loop below we're going to point
+            // debug variables to the new subprogram. If we don't remove them from the old
+            // subpgoram, we'll hit a debug assertions when processing the old sub program since its
+            // debug variables no longer point to it.  See the NumAbstractSubprograms assertion in
+            // DwarfDebug::endFunctionImpl in LLVM.
+            let empty_node = LLVMMDNodeInContext2(self.context, core::ptr::null_mut(), 0);
+            LLVMReplaceMDNodeOperandWith(
+                LLVMMetadataAsValue(self.context, sub_program),
+                7,
+                empty_node,
+            );
+
+            for basic_block in function.basic_blocks_iter() {
+                for instruction in basic_block.instructions_iter() {
+                    // Update all debug locations to point to the new subprogram.
+                    let debug_loc = LLVMInstructionGetDebugLoc(instruction);
+                    if !debug_loc.is_null() {
+                        let debug_loc_val = LLVMMetadataAsValue(self.context, debug_loc);
+                        let old_scope = LLVMValueAsMetadata(LLVMGetOperand(debug_loc_val, 0));
+                        if old_scope == sub_program {
+                            LLVMReplaceMDNodeOperandWith(debug_loc_val, 0, new_program);
+                        }
+                    }
+
+                    // Handle llvm.dbg.declare and llvm.dbg.value. Those are instances of
+                    // `DbgVariableIntrinsic` and hold a variable we need to patch up.
+                    if let Some(variable) = dvi_variable(self.context, instruction) {
+                        let old_scope = LLVMValueAsMetadata(LLVMGetOperand(variable, 0));
+                        if old_scope == sub_program {
+                            // Make the variable's scope point to the new subprogram.
+                            LLVMReplaceMDNodeOperandWith(variable, 0, new_program);
+                        }
+                    }
+                }
+            }
+
             self.discover(function, 0);
 
             let params_count = LLVMCountParams(function);
@@ -339,6 +441,32 @@ impl DISanitizer {
         }
 
         LLVMDisposeDIBuilder(self.builder);
+    }
+}
+
+unsafe fn dvi_variable(context: LLVMContextRef, instruction: LLVMValueRef) -> Option<LLVMValueRef> {
+    if LLVMGetNumOperands(instruction) < 2 {
+        return None;
+    }
+    let op = LLVMGetOperand(instruction, 1);
+    if op.is_null() {
+        return None;
+    }
+    let op1_kind = LLVMGetValueKind(op);
+    match op1_kind {
+        LLVMValueKind::LLVMMetadataAsValueValueKind => {}
+        _ => return None,
+    }
+
+    let variable = LLVMValueAsMetadata(op);
+    if variable.is_null() {
+        return None;
+    }
+    let kind = LLVMGetMetadataKind(variable);
+    let variable_value = LLVMMetadataAsValue(context, variable);
+    match kind {
+        LLVMMetadataKind::LLVMDILocalVariableMetadataKind => return Some(variable_value),
+        _ => return None,
     }
 }
 
